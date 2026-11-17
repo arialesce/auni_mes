@@ -1,0 +1,312 @@
+---
+title: "Outputs: events, QC, activity, covariates, weather, anonymized plots"
+format: html
+---
+
+## How this file is organized
+
+This file **builds on data.qmd and does not change it**.
+
+
+## 0. Setup
+
+This copies the cleaning from data.qmd so the numbers match. The one change is that the lists `unhelpful`
+and `domestics` are defined **before** they are used (in data.qmd they come after, which breaks a fresh run).
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(lubridate)
+
+event_gap_min        <- 30     # minutes between detections of the same species at the same camera = new event
+min_trap_days        <- 60     # sites below this are FLAGGED, not removed
+max_unid_share       <- 0.10   # sites above this share of unidentified tags are FLAGGED
+min_events_activity  <- 30     # species with fewer events are left out of activity plots
+project_start        <- ymd("2025-05-01")
+export_date          <- ymd("2026-10-05")
+
+report_dir <- "UWIN_Penn_Vet_Accessing_Nature_May_2025_-_present_2026-10-05_Reports"
+report_file <- function(name) {
+  file.path(report_dir,
+            paste0("UWIN_Penn_Vet_UWIN_Penn_Vet_Accessing_Nature_May_2025_-_present_", name, ".csv"))
+}
+dir.create("outputs", showWarnings = FALSE)
+
+unhelpful <- c("STAFF/SETUP", "NONE", "Vehicle", "Unidentified")
+domestics <- c("Human", "Domestic Dog", "Domestic Cat (House Cat)")
+
+# cleaning
+locations <- read.csv(report_file("location_report")) |>
+  mutate(longitude = -abs(longitude)) |>   
+  mutate(latitude  =  abs(latitude))
+
+main_all <- read.csv(report_file("main_report")) |>      
+  mutate(longitude = -abs(longitude)) |>
+  mutate(latitude  =  abs(latitude)) |>
+  mutate(superlocation = str_extract(location, "[:alpha:]*")) |>
+  
+  mutate(datetime = ymd_hms(image_date_time, tz = "UTC"))
+
+main <- main_all |>                                       
+  filter(!(species_common_name %in% unhelpful)) |>
+  filter(!(species_common_name %in% domestics)) |>
+  filter(!(species_scientific_name == ""))
+
+sets <- read.csv(report_file("image_set_report")) |>
+  mutate(start = ymd_hms(trimws(image_set_start_date_time), tz = "UTC"),
+         end   = ymd_hms(trimws(image_set_end_date_time),   tz = "UTC"))
+sets_complete <- sets |> filter(image_set_status == "Tagging Complete")
+
+# wildlife rows that belong to finished sets only (sets still "Ready for Tagging" are incomplete)
+main_complete <- main |> semi_join(sets_complete, by = "image_set_id")
+
+cat("wildlife rows:", nrow(main), "| in finished sets:", nrow(main_complete), "\n")
+```
+
+## 1. Independent events
+
+**Why:** one animal walking past a camera can trigger many photos. Counting photos overstates activity.
+We count one **event** per animal visit: a new event starts when the same species at the same camera
+has not been seen for more than `event_gap_min` minutes. The proposal says the threshold must be stated in the report.
+
+```{r}
+#| label: events
+events <- main_complete |>
+  mutate(n_ind = suppressWarnings(as.numeric(individual_count))) |>   # "VNA" becomes NA
+  arrange(location, species_common_name, datetime) |>
+  group_by(location, species_common_name) |>
+  mutate(gap_min   = as.numeric(difftime(datetime, lag(datetime), units = "mins")),
+         new_event = is.na(gap_min) | gap_min > event_gap_min,
+         event_no  = cumsum(new_event)) |>
+  group_by(location, species_common_name, event_no) |>
+  summarise(event_start    = min(datetime),
+            event_end      = max(datetime),
+            n_images       = n(),
+            max_individuals = if (all(is.na(n_ind))) NA_real_ else max(n_ind, na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(event_id = row_number())
+
+cat("rows:", nrow(main_complete), "-> independent events:", nrow(events), "\n")
+
+events |> count(species_common_name, sort = TRUE) |> head(10)
+
+write_csv(events, "outputs/events.csv")
+```
+
+## 2. QC checks
+
+### 2a. Sampling effort (trap-days)
+
+```{r}
+#| label: effort
+effort_by_set <- sets |>
+  arrange(location, start) |>
+  group_by(location) |>
+  mutate(prev_max_end = lag(cummax(as.numeric(end)), default = -Inf),
+         eff_start    = pmax(as.numeric(start), prev_max_end),
+         eff_days     = pmax(as.numeric(end) - eff_start, 0) / 86400) |>
+  ungroup()
+
+effort <- effort_by_set |>
+  group_by(location) |>
+  summarise(n_sets            = n(),
+            n_sets_untagged   = sum(image_set_status != "Tagging Complete"),
+            images_untagged   = sum(image_set_count_total[image_set_status != "Tagging Complete"]),
+            first_image       = min(start),
+            last_image        = max(end),
+            trap_days_all     = sum(eff_days),
+            trap_days_tagged  = sum(eff_days[image_set_status == "Tagging Complete"]),
+            .groups = "drop")
+
+effort |> arrange(trap_days_tagged)
+```
+
+### 2b. Gaps between deployments
+
+Days with no data between one image set and the next at the same camera.
+
+```{r}
+#| label: gaps
+set_gaps <- sets |>
+  arrange(location, start) |>
+  group_by(location) |>
+  mutate(prev_end = lag(cummax(as.numeric(end))),
+         gap_days = (as.numeric(start) - prev_end) / 86400) |>
+  ungroup() |>
+  filter(!is.na(gap_days), gap_days > 7) |>
+  select(location, set_start = start, gap_days)
+
+set_gaps |> arrange(desc(gap_days))
+```
+
+### 2c. Timestamps
+
+
+```{r}
+#| label: timestamps
+main_all |>
+  summarise(missing_time   = sum(is.na(datetime)),
+            before_project = sum(datetime < project_start, na.rm = TRUE),
+            after_export   = sum(datetime > export_date + 1, na.rm = TRUE))
+
+main_all |>
+  left_join(select(sets, image_set_id, start, end), by = "image_set_id") |>
+  summarise(outside_set_window = sum(datetime < start | datetime > end + 60, na.rm = TRUE))
+```
+
+### 2d. Identification quality per site
+
+Share of animal tags that could not be identified to species (blank scientific name), the share of tags
+flagged for review, and the share of blurred images.
+
+```{r}
+#| label: id_quality
+images <- read.csv(report_file("image_report"))
+
+id_quality <- main_all |>
+  semi_join(sets_complete, by = "image_set_id") |>
+  filter(!(species_common_name %in% c("NONE", "STAFF/SETUP", "Vehicle", "Human"))) |>
+  group_by(location) |>
+  summarise(n_animal_tags = n(),
+            unid_share    = mean(species_scientific_name == ""),
+            review_share  = mean(tag_needs_review == "t"),
+            .groups = "drop")
+
+blur <- images |>
+  group_by(location) |>
+  summarise(blur_share = mean(image_is_blurred == "t"), .groups = "drop")
+
+id_quality |> arrange(desc(unid_share)) |> head(10)
+```
+
+### 2e. One table per site
+
+Combines effort, events, species richness and the QC flags. **Detections per 100 trap-days** lets cameras with
+different run times be compared.
+
+```{r}
+#| label: site_summary
+site_summary <- effort |>
+  left_join(count(events, location, name = "n_events"), by = "location") |>
+  left_join(main_complete |> group_by(location) |>
+              summarise(species_richness = n_distinct(species_common_name)), by = "location") |>
+  left_join(id_quality, by = "location") |>
+  left_join(blur, by = "location") |>
+  mutate(n_events = replace_na(n_events, 0),
+         events_per_100_trap_days = if_else(trap_days_tagged > 0,
+                                            n_events / trap_days_tagged * 100, NA_real_),
+         flag_no_tagged_data = trap_days_tagged == 0,
+         flag_low_effort     = trap_days_tagged > 0 & trap_days_tagged < min_trap_days,
+         flag_high_unid      = !is.na(unid_share) & unid_share > max_unid_share)
+
+site_summary |>
+  select(location, trap_days_tagged, n_events, events_per_100_trap_days,
+         species_richness, unid_share, starts_with("flag_")) |>
+  arrange(location)
+
+write_csv(site_summary, "outputs/qc_site_summary.csv")
+```
+
+## 3. Activity patterns
+
+**How:** This uses `events` (not photos) and each event's start time. Only species with at least
+`min_events_activity` events are used, because curves from a handful of events are not meaningful.
+
+```{r}
+#| label: activity_data
+act <- events |>
+  mutate(hour_dec = hour(event_start) + minute(event_start) / 60 + second(event_start) / 3600,
+         time_rad = hour_dec / 24 * 2 * pi)      # the overlap package wants radians
+
+species_ok <- act |> count(species_common_name) |> filter(n >= min_events_activity) |> pull(species_common_name)
+act_ok <- act |> filter(species_common_name %in% species_ok)
+cat("species with enough events:", length(species_ok), "\n")
+```
+
+Hour-of-day curves. Midnight and 24:00 are the same moment, so the data is copied one day before and after,
+which keeps the curve from dropping at the edges.
+
+```{r}
+#| label: activity_plot
+wrap <- bind_rows(act_ok,
+                  act_ok |> mutate(hour_dec = hour_dec - 24),
+                  act_ok |> mutate(hour_dec = hour_dec + 24))
+
+ggplot(wrap, aes(hour_dec)) +
+  geom_density(aes(y = after_stat(density) * 3), fill = "grey70") +
+  facet_wrap(~ species_common_name) +
+  coord_cartesian(xlim = c(0, 24)) +
+  scale_x_continuous(breaks = seq(0, 24, 6)) +
+  labs(x = "Hour of day (camera clock)", y = "Relative activity") +
+  theme_bw()
+```
+
+Pairwise overlap (coefficient of overlap, 0 = never active at the same time, 1 = identical activity pattern).
+The `overlap` package suggests the `Dhat1` estimator when the smaller sample is small (roughly under 50)
+and `Dhat4` for larger samples. Install once with `install.packages("overlap")`.
+
+```{r}
+#| label: activity_overlap
+library(overlap)
+library(suntools)
+
+pairs <- combn(species_ok, 2, simplify = FALSE)
+
+activity_overlap <- map_dfr(pairs, function(p) {
+  a <- act_ok$time_rad[act_ok$species_common_name == p[1]]
+  b <- act_ok$time_rad[act_ok$species_common_name == p[2]]
+  est_type <- if (min(length(a), length(b)) < 50) "Dhat1" else "Dhat4"
+  tibble(species_a = p[1], species_b = p[2], n_a = length(a), n_b = length(b),
+         estimator = est_type, overlap = unname(overlapEst(a, b, type = est_type)))
+})
+
+activity_overlap |> arrange(desc(overlap))
+write_csv(activity_overlap, "outputs/activity_overlap.csv")
+
+# One pair drawn as two curves (change the species names):
+a <- act_ok$time_rad[act_ok$species_common_name == "Red Fox"]
+b <- act_ok$time_rad[act_ok$species_common_name == "Common Raccoon"]
+overlapPlot(a, b)
+```
+
+
+## 4. Anonymized outputs (no locations)
+
+**What this means:** the public dashboard must not show real camera names or coordinates. The proposal says to use labels
+like "Location 1". Names such as `morris_1` or `kaskey_1` give away the site, so the labels below are assigned in a random
+but repeatable order. The code in sections 1 to 5 keeps the real names (internal use). Only the plots in this section
+are public-safe.
+
+The file `outputs/PRIVATE_site_key.csv` maps real names to labels. Do not commit or share it. A good habit is to
+add `outputs/PRIVATE_*` to `.gitignore`.
+
+A true map with points is a team and AUNI decision (for example a map of coarse grid cells), so this section
+uses a site-by-species chart instead.
+
+```{r}
+#| label: anonymized
+set.seed(2026)
+site_key <- tibble(location = sample(sort(unique(locations$location)))) |>
+  mutate(site_label = sprintf("Location %02d", row_number()))
+
+write_csv(site_key, "outputs/PRIVATE_site_key.csv")
+
+# events per 100 trap-days for each site and species (finished sites only)
+public_tbl <- events |>
+  count(location, species_common_name, name = "n_events") |>
+  left_join(select(effort, location, trap_days_tagged), by = "location") |>
+  filter(trap_days_tagged > 0) |>
+  mutate(rate = n_events / trap_days_tagged * 100) |>
+  left_join(site_key, by = "location")
+
+top_species <- events |> count(species_common_name, sort = TRUE) |> head(8) |> pull(species_common_name)
+
+public_tbl |>
+  filter(species_common_name %in% top_species) |>
+  ggplot(aes(species_common_name, site_label, fill = rate)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Events per\n100 trap-days") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
